@@ -71,6 +71,7 @@ Sau khi hoàn thành Lab 04, mỗi nhóm cần làm được:
 - Kiểm tra được functional, auth, negative, boundary và schema lỗi `ProblemDetails`.
 - Xuất Newman report làm bằng chứng.
 - Viết được `RUN_LOCAL.md` hướng dẫn người khác chạy lại trong 3–5 bước.
+- Có lệnh `npm run start:local` để khởi chạy dịch vụ local trước khi test.
 
 ---
 

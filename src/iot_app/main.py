@@ -1,265 +1,273 @@
-import os
-from datetime import datetime, timezone
-from enum import Enum
-from typing import Dict, List, Optional
+# src/iot_app/main.py
+"""
+IoT Ingestion Service - Smart Campus Platform
+Provides API endpoints for ingesting sensor telemetry data.
+"""
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
+from fastapi import FastAPI, HTTPException, status, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+from typing import Optional, List
+from datetime import datetime
+import uuid
+import os
+from contextlib import asynccontextmanager
 
-
-SERVICE_NAME = os.getenv("SERVICE_NAME", "iot-ingestion")
-SERVICE_VERSION = os.getenv("SERVICE_VERSION", "0.4.0")
+# Configuration
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "local-dev-token")
+RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "60"))
+
+# In-memory storage (for lab purposes)
+readings_store = []
+rate_limit_counter = {}
 
 
-app = FastAPI(
-    title="FIT4110 Lab 04 - IoT Ingestion Service",
-    version=SERVICE_VERSION,
-    description=(
-        "Dockerized IoT Ingestion API aligned with the Lab 03 OpenAPI/Postman contract."
-    ),
-)
-
-
-class SensorMetric(str, Enum):
-    temperature = "temperature"
-    humidity = "humidity"
-    motion = "motion"
-    smoke = "smoke"
-
-
-class SensorUnit(str, Enum):
-    celsius = "celsius"
-    percent = "percent"
-    boolean = "boolean"
-    ppm = "ppm"
+class SensorMetric(str):
+    """Sensor metric types"""
+    TEMPERATURE = "temperature"
+    HUMIDITY = "humidity"
+    MOTION = "motion"
+    SMOKE = "smoke"
 
 
 class ProblemDetails(BaseModel):
-    type: str = "about:blank"
+    """RFC 7807 Problem Details for error responses"""
+    type: str
     title: str
-    status: int = Field(..., ge=400, le=599)
+    status: int
     detail: str
     instance: Optional[str] = None
 
 
+class SensorReadingCreate(BaseModel):
+    """Request model for creating a sensor reading"""
+    device_id: str = Field(..., min_length=3, example="ESP32-LAB-A01")
+    metric: str = Field(..., description="Sensor metric type")
+    value: float = Field(..., description="Sensor value")
+    unit: str = Field(..., description="Unit of measurement")
+    timestamp: str = Field(..., description="ISO 8601 timestamp")
+
+    @field_validator('metric')
+    def validate_metric(cls, v):
+        allowed = ['temperature', 'humidity', 'motion', 'smoke']
+        if v not in allowed:
+            raise ValueError(f'metric must be one of {allowed}')
+        return v
+
+    @field_validator('value')
+    def validate_value(cls, v, info):
+        metric = info.data.get('metric')
+        if metric == 'temperature':
+            if v < -40 or v > 80:
+                raise ValueError('temperature must be between -40 and 80')
+        elif metric == 'humidity':
+            if v < 0 or v > 100:
+                raise ValueError('humidity must be between 0 and 100')
+        elif metric == 'motion':
+            if v not in [0, 1]:
+                raise ValueError('motion must be 0 or 1')
+        elif metric == 'smoke':
+            if v < 0 or v > 1000:
+                raise ValueError('smoke must be between 0 and 1000')
+        return v
+
+    @field_validator('unit')
+    def validate_unit(cls, v, info):
+        metric = info.data.get('metric')
+        unit_map = {
+            'temperature': ['celsius'],
+            'humidity': ['percent'],
+            'motion': ['boolean'],
+            'smoke': ['ppm']
+        }
+        allowed = unit_map.get(metric, [])
+        if v not in allowed:
+            raise ValueError(f'unit for {metric} must be {allowed}')
+        return v
+
+
+class SensorReadingCreated(BaseModel):
+    """Response model for created sensor reading"""
+    reading_id: str
+    device_id: str
+    metric: str
+    accepted: bool
+    created_at: str
+
+
+class SensorReading(SensorReadingCreate):
+    """Full sensor reading model with ID"""
+    reading_id: str
+
+
 class HealthResponse(BaseModel):
+    """Health check response"""
     status: str
     service: str
     version: str
 
 
-class SensorReadingCreate(BaseModel):
-    device_id: str = Field(..., min_length=3, examples=["ESP32-LAB-A01"])
-    metric: SensorMetric = Field(..., examples=["temperature"])
-    value: float = Field(
-        ...,
-        ge=-40,
-        le=80,
-        description="Boundary range used in Lab 03 and Lab 04: -40 to 80.",
-        examples=[31.5],
-    )
-    unit: Optional[SensorUnit] = Field(default=None, examples=["celsius"])
-    timestamp: str = Field(..., examples=["2026-05-13T08:30:00+07:00"])
+# Create FastAPI app
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    print("IoT Ingestion Service starting...")
+    yield
+    # Shutdown
+    print("IoT Ingestion Service shutting down...")
 
 
-class SensorReading(BaseModel):
-    reading_id: str
-    device_id: str
-    metric: SensorMetric
-    value: float
-    unit: Optional[SensorUnit] = None
-    timestamp: str
-    created_at: str
+app = FastAPI(
+    title="Smart Campus — IoT Ingestion API",
+    version="0.4.0",
+    description="API for ingesting sensor telemetry from IoT devices",
+    lifespan=lifespan
+)
 
 
-class SensorReadingCreated(BaseModel):
-    reading_id: str
-    device_id: str
-    metric: SensorMetric
-    accepted: bool
-    created_at: str
+# Middleware for authentication
+@app.middleware("http")
+async def authenticate(request: Request, call_next):
+    # Skip auth for health endpoint
+    if request.url.path == "/health":
+        return await call_next(request)
 
-
-READINGS: List[Dict] = []
-
-
-def build_problem(
-    *,
-    status_code: int,
-    title: str,
-    detail: str,
-    instance: Optional[str] = None,
-    problem_type: str = "about:blank",
-) -> Dict:
-    problem = {
-        "type": problem_type,
-        "title": title,
-        "status": status_code,
-        "detail": detail,
-    }
-    if instance:
-        problem["instance"] = instance
-    return problem
-
-
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
-    if isinstance(exc.detail, dict):
-        problem = exc.detail
-    else:
-        problem = build_problem(
-            status_code=exc.status_code,
-            title=status.HTTP_STATUS_CODES.get(exc.status_code, "HTTP Error"),
-            detail=str(exc.detail),
-            instance=str(request.url.path),
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={
+                "type": "https://smart-campus.local/problems/unauthorized",
+                "title": "Unauthorized",
+                "status": 401,
+                "detail": "Missing Authorization header",
+                "instance": request.url.path
+            }
         )
 
-    problem.setdefault("status", exc.status_code)
-    problem.setdefault("title", status.HTTP_STATUS_CODES.get(exc.status_code, "HTTP Error"))
-    problem.setdefault("type", "about:blank")
-    problem.setdefault("detail", "Request failed")
-    problem.setdefault("instance", str(request.url.path))
+    # Check Bearer token
+    if not auth_header.startswith("Bearer "):
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={
+                "type": "https://smart-campus.local/problems/unauthorized",
+                "title": "Unauthorized",
+                "status": 401,
+                "detail": "Invalid authorization scheme. Use Bearer token",
+                "instance": request.url.path
+            }
+        )
 
-    return JSONResponse(
-        status_code=exc.status_code,
-        content=problem,
-        media_type="application/problem+json",
-        headers=getattr(exc, "headers", None),
-    )
+    token = auth_header.split(" ")[1]
+    if token != AUTH_TOKEN:
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={
+                "type": "https://smart-campus.local/problems/unauthorized",
+                "title": "Unauthorized",
+                "status": 401,
+                "detail": "Invalid token",
+                "instance": request.url.path
+            }
+        )
+
+    return await call_next(request)
 
 
+# Exception handlers
 @app.exception_handler(RequestValidationError)
-async def validation_exception_handler(
-    request: Request, exc: RequestValidationError
-) -> JSONResponse:
-    first_error = exc.errors()[0] if exc.errors() else {}
-    location = ".".join(str(item) for item in first_error.get("loc", []))
-    message = first_error.get("msg", "Request validation error")
-    detail = f"{location}: {message}" if location else message
-
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
     return JSONResponse(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content=build_problem(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            title="Validation error",
-            detail=detail,
-            instance=str(request.url.path),
-            problem_type="https://smart-campus.local/problems/validation-error",
-        ),
-        media_type="application/problem+json",
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content={
+            "type": "https://smart-campus.local/problems/validation-error",
+            "title": "Validation error",
+            "status": 400,
+            "detail": jsonable_encoder(exc.errors()),
+            "instance": request.url.path
+        }
     )
 
 
-def verify_bearer_token(authorization: Optional[str] = Header(default=None)) -> None:
-    if not authorization:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=build_problem(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                title="Unauthorized",
-                detail="Missing Authorization header",
-                problem_type="https://smart-campus.local/problems/unauthorized",
-            ),
-        )
-
-    expected = f"Bearer {AUTH_TOKEN}"
-    if authorization != expected:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=build_problem(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                title="Unauthorized",
-                detail="Invalid bearer token",
-                problem_type="https://smart-campus.local/problems/unauthorized",
-            ),
-        )
+@app.exception_handler(ValueError)
+async def value_error_handler(request: Request, exc: ValueError):
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content={
+            "type": "https://smart-campus.local/problems/validation-error",
+            "title": "Validation error",
+            "status": 400,
+            "detail": str(exc),
+            "instance": request.url.path
+        }
+    )
 
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def next_reading_id() -> str:
-    today = datetime.now(timezone.utc).strftime("%Y%m%d")
-    return f"R-{today}-{len(READINGS) + 1:04d}"
-
-
-@app.get("/health", response_model=HealthResponse)
-def health() -> HealthResponse:
+# Health check endpoint
+@app.api_route("/health", methods=["GET", "HEAD"], response_model=HealthResponse, tags=["system"])
+async def health_check():
+    """Check if the service is running"""
     return HealthResponse(
         status="ok",
-        service=SERVICE_NAME,
-        version=SERVICE_VERSION,
+        service="iot-ingestion",
+        version="0.4.0"
     )
 
 
-@app.post(
-    "/readings",
-    response_model=SensorReadingCreated,
-    status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(verify_bearer_token)],
-    responses={
-        401: {"model": ProblemDetails},
-        422: {"model": ProblemDetails},
-        429: {"model": ProblemDetails},
-    },
-)
-def create_reading(payload: SensorReadingCreate, response: Response) -> SensorReadingCreated:
-    if payload.metric == SensorMetric.temperature and payload.value >= 70:
-        response.headers["X-Warning"] = "high-temperature"
+# Create reading endpoint
+@app.post("/readings", response_model=SensorReadingCreated, status_code=status.HTTP_201_CREATED, tags=["readings"])
+async def create_reading(reading: SensorReadingCreate):
+    """Ingest a new sensor reading from an IoT device"""
+    reading_id = f"R-{datetime.now().strftime('%Y%m%d')}-{len(readings_store) + 1:04d}"
 
-    reading_id = next_reading_id()
-    created_at = now_iso()
-
-    item = {
-        "reading_id": reading_id,
-        "device_id": payload.device_id,
-        "metric": payload.metric.value,
-        "value": payload.value,
-        "unit": payload.unit.value if payload.unit else None,
-        "timestamp": payload.timestamp,
-        "created_at": created_at,
-    }
-    READINGS.append(item)
+    # Store the reading
+    stored_reading = reading.model_dump()
+    stored_reading["reading_id"] = reading_id
+    readings_store.append(stored_reading)
 
     return SensorReadingCreated(
         reading_id=reading_id,
-        device_id=payload.device_id,
-        metric=payload.metric,
+        device_id=reading.device_id,
+        metric=reading.metric,
         accepted=True,
-        created_at=created_at,
+        created_at=datetime.now().isoformat()
     )
 
 
-@app.get("/readings/latest", dependencies=[Depends(verify_bearer_token)])
-def latest_readings(
-    device_id: Optional[str] = Query(default=None),
-    limit: int = Query(default=10, ge=1, le=100),
-) -> Dict[str, List[Dict]]:
-    items = READINGS
+# Get latest readings endpoint
+@app.get("/readings/latest", tags=["readings"])
+async def get_latest_readings(
+    device_id: Optional[str] = None,
+    limit: int = 10
+):
+    """Get the most recent sensor readings"""
+    if limit < 1 or limit > 100:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="limit must be between 1 and 100"
+        )
 
+    # Filter by device_id if provided
+    filtered = readings_store
     if device_id:
-        items = [item for item in items if item["device_id"] == device_id]
+        filtered = [r for r in filtered if r["device_id"] == device_id]
 
-    return {"items": items[-limit:]}
+    # Get latest by reversing (most recent first)
+    latest = filtered[::-1][:limit]
+
+    return {"items": latest}
 
 
-@app.get("/readings/{reading_id}", dependencies=[Depends(verify_bearer_token)])
-def get_reading(reading_id: str) -> Dict:
-    for item in READINGS:
-        if item["reading_id"] == reading_id:
-            return item
-
+# Get reading by ID
+@app.get("/readings/{reading_id}", tags=["readings"])
+async def get_reading(reading_id: str):
+    """Get a specific sensor reading by ID"""
+    for reading in readings_store:
+        if reading["reading_id"] == reading_id:
+            return reading
     raise HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,
-        detail=build_problem(
-            status_code=status.HTTP_404_NOT_FOUND,
-            title="Not Found",
-            detail=f"Reading {reading_id} does not exist",
-            instance=f"/readings/{reading_id}",
-            problem_type="https://smart-campus.local/problems/not-found",
-        ),
+        detail=f"Reading {reading_id} not found"
     )

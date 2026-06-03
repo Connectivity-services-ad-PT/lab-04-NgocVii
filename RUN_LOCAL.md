@@ -1,37 +1,35 @@
-# RUN_LOCAL.md – Hướng dẫn chạy Lab 04
+# RUN_LOCAL.md - IoT Ingestion Service
 
-Tài liệu này giúp người khác clone repo sạch và chạy lại service trong Docker.
+## Prerequisites
 
----
+- Docker Desktop (or Docker Engine)
+- Node.js 20.x LTS + npm
+- Git
+- curl (for testing)
 
-## 1. Clone repo
+## Quick Start (3 steps)
+
+### Step 1: Clone and build
 
 ```bash
-git clone <repo-url>
+git clone <your-repo-url>
 cd FIT4110_lab04_docker_packaging
-```
-
----
-
-## 2. Cài dependencies cho Newman/Prism/Spectral
-
-```bash
 npm install
 ```
 
----
+### Step 2: Start the service locally
 
-## 3. Build Docker image
+Option 1: Start with Python directly
+
+```bash
+python -m uvicorn iot_app.main:app --app-dir src --host 0.0.0.0 --port 8000
+```
+
+Option 2: Build and run with Docker
 
 ```bash
 docker build -t fit4110/iot-ingestion:lab04 .
-```
 
----
-
-## 4. Run container
-
-```bash
 docker run --rm \
   --name fit4110-iot-lab04 \
   -p 8000:8000 \
@@ -39,54 +37,34 @@ docker run --rm \
   fit4110/iot-ingestion:lab04
 ```
 
-Mở terminal khác, kiểm tra:
-
-```bash
-curl http://localhost:8000/health
-```
-
-Kết quả mong đợi:
-
-```json
-{
-  "status": "ok",
-  "service": "iot-ingestion",
-  "version": "0.4.0"
-}
-```
-
----
-
-## 5. Chạy Newman test trên container
+### Step 3: Run Newman tests
 
 ```bash
 npm run test:local
 ```
 
-Report sinh tại:
-
-```text
-reports/newman-lab04-local.xml
-reports/newman-lab04-local.html
-```
-
----
-
-## 6. Dừng container
-
-Nếu không dùng `--rm` hoặc container còn chạy:
+### Health check
 
 ```bash
-docker stop fit4110-iot-lab04
+curl http://localhost:8000/health
 ```
 
----
-
-## 7. Lệnh nhanh
+### Example requests
 
 ```bash
-make build
-make run
-make test-docker
-make stop
+# Create a reading
+curl -X POST http://localhost:8000/readings \
+  -H "Authorization: Bearer local-dev-token" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "device_id": "ESP32-LAB-A01",
+    "metric": "temperature",
+    "value": 31.5,
+    "unit": "celsius",
+    "timestamp": "2026-06-03T08:30:00+07:00"
+  }'
+
+# Get latest readings
+curl "http://localhost:8000/readings/latest?limit=5" \
+  -H "Authorization: Bearer local-dev-token"
 ```

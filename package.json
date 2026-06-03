@@ -6,8 +6,12 @@
   "scripts": {
     "mock:iot": "prism mock contracts/iot-ingestion.openapi.yaml --host 0.0.0.0 --port 4010",
     "lint:openapi": "spectral lint contracts/*.yaml",
+    "start:local": "node scripts/start-local.js",
+    "docker:build": "docker build -t fit4110/iot-ingestion:lab04 .",
+    "docker:run": "docker run -d --rm --name fit4110-iot-lab04 -p 8000:8000 --env-file .env.example fit4110/iot-ingestion:lab04",
+    "docker:stop": "docker stop fit4110-iot-lab04 || true",
     "test:mock": "newman run postman/collections/FIT4110_lab04_iot_docker.postman_collection.json -e postman/environments/FIT4110_lab04_mock.postman_environment.json -r cli,junit,htmlextra --reporter-junit-export reports/newman-lab04-mock.xml --reporter-htmlextra-export reports/newman-lab04-mock.html",
-    "test:local": "newman run postman/collections/FIT4110_lab04_iot_docker.postman_collection.json -e postman/environments/FIT4110_lab04_local.postman_environment.json -r cli,junit,htmlextra --reporter-junit-export reports/newman-lab04-local.xml --reporter-htmlextra-export reports/newman-lab04-local.html"
+    "test:local": "wait-on http://localhost:8000/health && newman run postman/collections/FIT4110_lab04_iot_docker.postman_collection.json -e postman/environments/FIT4110_lab04_local.postman_environment.json -r cli,junit,htmlextra --reporter-junit-export reports/newman-lab04-local.xml --reporter-htmlextra-export reports/newman-lab04-local.html"
   },
   "devDependencies": {
     "@stoplight/prism-cli": "^5.10.0",
